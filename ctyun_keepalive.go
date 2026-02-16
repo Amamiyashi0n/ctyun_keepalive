@@ -114,6 +114,16 @@ type SendInfo struct {
 	Data []byte
 }
 
+type Account struct {
+	UserAccount string `json:"user_account"`
+	Password    string `json:"password"`
+	DeviceCode  string `json:"device_code"`
+}
+
+type AccountsFile struct {
+	Accounts []Account `json:"accounts"`
+}
+
 func (s SendInfo) ToBuffer(isBuildMsg bool) []byte {
 	msgLength := 0
 	if isBuildMsg {
@@ -598,15 +608,52 @@ func resolveCredentials() (string, string, string) {
 	if _, err := os.Stat("/.dockerenv"); err == nil {
 		return os.Getenv("APP_USER"), os.Getenv("APP_PASSWORD"), os.Getenv("DEVICECODE")
 	}
-	deviceFile := "DeviceCode.txt"
-	if _, err := os.Stat(deviceFile); errors.Is(err, os.ErrNotExist) {
-		_ = os.WriteFile(deviceFile, []byte("web_"+generateRandomString(32)), 0644)
+	
+	accountsFile := "accounts.json"
+	var accounts AccountsFile
+	
+	if data, err := os.ReadFile(accountsFile); err == nil {
+		if err := json.Unmarshal(data, &accounts); err == nil && len(accounts.Accounts) > 0 {
+			account := accounts.Accounts[0]
+			userBytes, _ := base64.StdEncoding.DecodeString(account.UserAccount)
+			passwordBytes, _ := base64.StdEncoding.DecodeString(account.Password)
+			return string(userBytes), string(passwordBytes), account.DeviceCode
+		}
 	}
-	codeBytes, _ := os.ReadFile(deviceFile)
-	code := strings.TrimSpace(string(codeBytes))
-	user := readLine("账号: ")
-	password := readLine("密码: ")
-	return user, password, code
+	
+	for {
+		deviceCode := "web_" + generateRandomString(32)
+		user := readLine("账号: ")
+		password := readLine("密码: ")
+		
+		encodedUser := base64.StdEncoding.EncodeToString([]byte(user))
+		encodedPassword := base64.StdEncoding.EncodeToString([]byte(password))
+		
+		accounts.Accounts = append(accounts.Accounts, Account{
+			UserAccount: encodedUser,
+			Password:    encodedPassword,
+			DeviceCode:  deviceCode,
+		})
+		
+		_ = os.WriteFile("DeviceCode.txt", []byte(deviceCode), 0644)
+		
+		continueInput := readLine("是否继续添加账户? (y/n): ")
+		if strings.ToLower(strings.TrimSpace(continueInput)) != "y" {
+			break
+		}
+	}
+	
+	data, _ := json.MarshalIndent(accounts, "", "  ")
+	_ = os.WriteFile(accountsFile, data, 0644)
+	
+	if len(accounts.Accounts) > 0 {
+		account := accounts.Accounts[0]
+		userBytes, _ := base64.StdEncoding.DecodeString(account.UserAccount)
+		passwordBytes, _ := base64.StdEncoding.DecodeString(account.Password)
+		return string(userBytes), string(passwordBytes), account.DeviceCode
+	}
+	
+	return "", "", ""
 }
 
 func receiveLoop(ctx context.Context, conn *websocket.Conn, desktop Desktop, api *CtYunApi) error {
@@ -693,7 +740,9 @@ func keepAliveWorker(ctx context.Context, desktop Desktop, api *CtYunApi, wg *sy
 		_ = conn.Close()
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNoStatusReceived) || strings.Contains(err.Error(), "1005") {
-				writeLine(fmt.Sprintf("[%s] 连接被对端关闭(1005)，不影响脚本使用，准备重连", desktop.DesktopCode))
+				writeLine(fmt.Sprintf("[%s] 警告: 连接被对端关闭(1005)，不影响脚本使用，准备重连", desktop.DesktopCode))
+			} else if strings.Contains(err.Error(), "connection reset by peer") {
+				writeLine(fmt.Sprintf("[%s] 警告: 连接被对端重置，不影响脚本使用，准备重连", desktop.DesktopCode))
 			} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				writeLine(fmt.Sprintf("[%s] 异常: %v", desktop.DesktopCode, err))
 			}
