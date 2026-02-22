@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -29,8 +29,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 type LoginInfo struct {
@@ -153,6 +151,304 @@ type AccountsFile struct {
 	Accounts []Account `json:"accounts"`
 }
 
+var initialPayload []byte
+
+func init() {
+	initialPayload, _ = base64.StdEncoding.DecodeString("UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA")
+}
+
+const (
+	wsTextMessage   = 1
+	wsBinaryMessage = 2
+	wsCloseMessage  = 8
+	wsPingMessage   = 9
+	wsPongMessage   = 10
+)
+
+const (
+	wsCloseNormalClosure   = 1000
+	wsCloseNoStatusReceived = 1005
+)
+
+type wsCloseError struct {
+	Code int
+	Text string
+}
+
+func (e wsCloseError) Error() string {
+	if e.Text == "" {
+		return fmt.Sprintf("websocket close: %d", e.Code)
+	}
+	return fmt.Sprintf("websocket close: %d %s", e.Code, e.Text)
+}
+
+type WSConn struct {
+	conn       net.Conn
+	reader     *bufio.Reader
+	writeMu    sync.Mutex
+	readBuf    []byte
+	messageBuf []byte
+	maskBuf    []byte
+}
+
+func newWSConn(conn net.Conn) *WSConn {
+	return &WSConn{
+		conn:       conn,
+		reader:     bufio.NewReader(conn),
+		readBuf:    nil,
+		messageBuf: nil,
+		maskBuf:    nil,
+	}
+}
+
+func dialWebSocket(uri, origin, subprotocol string) (*WSConn, *http.Response, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, nil, err
+	}
+	host := u.Host
+	addr := host
+	if !strings.Contains(host, ":") {
+		if u.Scheme == "wss" {
+			addr = host + ":443"
+		} else {
+			addr = host + ":80"
+		}
+	}
+	var conn net.Conn
+	if u.Scheme == "wss" {
+		serverName := host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			serverName = h
+		}
+		conn, err = tls.Dial("tcp", addr, &tls.Config{ServerName: serverName})
+	} else {
+		conn, err = net.Dial("tcp", addr)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	keyBytes := make([]byte, 16)
+	_, _ = rand.Read(keyBytes)
+	key := base64.StdEncoding.EncodeToString(keyBytes)
+	path := u.RequestURI()
+	if path == "" {
+		path = "/"
+	}
+	var request bytes.Buffer
+	request.WriteString("GET " + path + " HTTP/1.1\r\n")
+	request.WriteString("Host: " + host + "\r\n")
+	request.WriteString("Upgrade: websocket\r\n")
+	request.WriteString("Connection: Upgrade\r\n")
+	request.WriteString("Sec-WebSocket-Key: " + key + "\r\n")
+	request.WriteString("Sec-WebSocket-Version: 13\r\n")
+	if origin != "" {
+		request.WriteString("Origin: " + origin + "\r\n")
+	}
+	if subprotocol != "" {
+		request.WriteString("Sec-WebSocket-Protocol: " + subprotocol + "\r\n")
+	}
+	request.WriteString("\r\n")
+	if _, err = conn.Write(request.Bytes()); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: "GET"})
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		_ = conn.Close()
+		return nil, resp, fmt.Errorf("websocket handshake failed: %s", resp.Status)
+	}
+	accept := resp.Header.Get("Sec-WebSocket-Accept")
+	acceptKey := computeSHA1Base64(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+	if accept != acceptKey {
+		_ = conn.Close()
+		return nil, resp, errors.New("websocket handshake validation failed")
+	}
+	return &WSConn{conn: conn, reader: reader}, resp, nil
+}
+
+func computeSHA1Base64(value string) string {
+	sum := sha1.Sum([]byte(value))
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func (c *WSConn) ReadMessage() (int, []byte, error) {
+	var messageOpcode int
+	messageData := c.messageBuf[:0]
+	for {
+		fin, opcode, payload, err := c.readFrame()
+		if err != nil {
+			return 0, nil, err
+		}
+		switch opcode {
+		case wsPingMessage:
+			_ = c.writeFrame(wsPongMessage, payload)
+			continue
+		case wsPongMessage:
+			continue
+		case wsCloseMessage:
+			code := wsCloseNoStatusReceived
+			text := ""
+			if len(payload) >= 2 {
+				code = int(binary.BigEndian.Uint16(payload[:2]))
+				if len(payload) > 2 {
+					text = string(payload[2:])
+				}
+			}
+			_ = c.writeFrame(wsCloseMessage, formatCloseMessage(code, text))
+			return 0, nil, wsCloseError{Code: code, Text: text}
+		case 0:
+			if messageOpcode == 0 {
+				continue
+			}
+			messageData = append(messageData, payload...)
+			c.messageBuf = messageData
+			if fin {
+				return messageOpcode, messageData, nil
+			}
+		case wsTextMessage, wsBinaryMessage:
+			if fin {
+				return opcode, payload, nil
+			}
+			messageOpcode = opcode
+			messageData = append(messageData, payload...)
+			c.messageBuf = messageData
+		}
+	}
+}
+
+func (c *WSConn) WriteMessage(messageType int, data []byte) error {
+	return c.writeFrame(messageType, data)
+}
+
+func (c *WSConn) WriteControl(messageType int, data []byte, _ time.Time) error {
+	return c.writeFrame(messageType, data)
+}
+
+func (c *WSConn) Close() error {
+	return c.conn.Close()
+}
+
+func (c *WSConn) readFrame() (bool, int, []byte, error) {
+	var header [2]byte
+	if _, err := io.ReadFull(c.reader, header[:]); err != nil {
+		return false, 0, nil, err
+	}
+	b0 := header[0]
+	b1 := header[1]
+	fin := b0&0x80 != 0
+	opcode := int(b0 & 0x0f)
+	masked := b1&0x80 != 0
+	payloadLen := int(b1 & 0x7f)
+	if payloadLen == 126 {
+		var ext [2]byte
+		if _, err := io.ReadFull(c.reader, ext[:]); err != nil {
+			return false, 0, nil, err
+		}
+		payloadLen = int(binary.BigEndian.Uint16(ext[:]))
+	} else if payloadLen == 127 {
+		var ext [8]byte
+		if _, err := io.ReadFull(c.reader, ext[:]); err != nil {
+			return false, 0, nil, err
+		}
+		length := binary.BigEndian.Uint64(ext[:])
+		if length > uint64(^uint(0)>>1) {
+			return false, 0, nil, errors.New("payload too large")
+		}
+		payloadLen = int(length)
+	}
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(c.reader, maskKey[:]); err != nil {
+			return false, 0, nil, err
+		}
+	}
+	if cap(c.readBuf) < payloadLen {
+		c.readBuf = make([]byte, payloadLen)
+	}
+	payload := c.readBuf[:payloadLen]
+	if payloadLen > 0 {
+		if _, err := io.ReadFull(c.reader, payload); err != nil {
+			return false, 0, nil, err
+		}
+	}
+	if masked {
+		for i := 0; i < payloadLen; i++ {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+	return fin, opcode, payload, nil
+}
+
+func (c *WSConn) writeFrame(messageType int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	var header [14]byte
+	headerLen := 0
+	header[0] = byte(0x80 | byte(messageType&0x0f))
+	headerLen++
+	payloadLen := len(data)
+	maskBit := byte(0x80)
+	if payloadLen < 126 {
+		header[headerLen] = maskBit | byte(payloadLen)
+		headerLen++
+	} else if payloadLen <= 0xffff {
+		header[headerLen] = maskBit | 126
+		headerLen++
+		binary.BigEndian.PutUint16(header[headerLen:headerLen+2], uint16(payloadLen))
+		headerLen += 2
+	} else {
+		header[headerLen] = maskBit | 127
+		headerLen++
+		binary.BigEndian.PutUint64(header[headerLen:headerLen+8], uint64(payloadLen))
+		headerLen += 8
+	}
+	var maskKey [4]byte
+	_, _ = rand.Read(maskKey[:])
+	copy(header[headerLen:headerLen+4], maskKey[:])
+	headerLen += 4
+	if cap(c.maskBuf) < payloadLen {
+		c.maskBuf = make([]byte, payloadLen)
+	}
+	masked := c.maskBuf[:payloadLen]
+	for i := 0; i < payloadLen; i++ {
+		masked[i] = data[i] ^ maskKey[i%4]
+	}
+	if _, err := c.conn.Write(header[:headerLen]); err != nil {
+		return err
+	}
+	if payloadLen > 0 {
+		_, err := c.conn.Write(masked)
+		return err
+	}
+	return nil
+}
+
+func formatCloseMessage(code int, text string) []byte {
+	if code == 0 {
+		return nil
+	}
+	buf := make([]byte, 2+len(text))
+	binary.BigEndian.PutUint16(buf[0:2], uint16(code))
+	copy(buf[2:], []byte(text))
+	return buf
+}
+
+func isCloseError(err error, code int) bool {
+	if err == nil {
+		return false
+	}
+	if e, ok := err.(wsCloseError); ok {
+		return e.Code == code
+	}
+	return false
+}
+
 func (s SendInfo) ToBuffer(isBuildMsg bool) []byte {
 	msgLength := 0
 	if isBuildMsg {
@@ -185,9 +481,7 @@ func SendInfoFromBuffer(buffer []byte) []SendInfo {
 		if dataLengthU > 0x7fffffff {
 			remaining := len(buffer) - offset
 			if remaining > 0 {
-				data := make([]byte, remaining)
-				copy(data, buffer[offset:offset+remaining])
-				results = append(results, SendInfo{Type: typeValue, Data: data})
+				results = append(results, SendInfo{Type: typeValue, Data: buffer[offset : offset+remaining]})
 			}
 			break
 		}
@@ -195,16 +489,13 @@ func SendInfoFromBuffer(buffer []byte) []SendInfo {
 		if offset+6+dataLength > len(buffer) {
 			remaining := len(buffer) - offset
 			if remaining > 0 {
-				data := make([]byte, remaining)
-				copy(data, buffer[offset:offset+remaining])
-				results = append(results, SendInfo{Type: typeValue, Data: data})
+				results = append(results, SendInfo{Type: typeValue, Data: buffer[offset : offset+remaining]})
 			}
 			break
 		}
-		data := []byte{}
+		var data []byte
 		if dataLength > 0 {
-			data = make([]byte, dataLength)
-			copy(data, buffer[offset+6:offset+6+dataLength])
+			data = buffer[offset+6 : offset+6+dataLength]
 		}
 		results = append(results, SendInfo{Type: typeValue, Data: data})
 		offset += 6 + dataLength
@@ -225,6 +516,41 @@ func SendInfoFromBuffer(buffer []byte) []SendInfo {
 	return results
 }
 
+func hasSendInfoType(buffer []byte, targetType int) bool {
+	if len(buffer) == 0 {
+		return false
+	}
+	offset := 0
+	for offset+6 <= len(buffer) {
+		typeValue := int(binary.LittleEndian.Uint16(buffer[offset : offset+2]))
+		dataLengthU := binary.LittleEndian.Uint32(buffer[offset+2 : offset+6])
+		if dataLengthU > 0x7fffffff {
+			return false
+		}
+		dataLength := int(dataLengthU)
+		if offset+6+dataLength > len(buffer) {
+			return false
+		}
+		if typeValue == targetType {
+			return true
+		}
+		offset += 6 + dataLength
+		if offset+6 > len(buffer) && offset < len(buffer) {
+			allZero := true
+			for i := offset; i < len(buffer); i++ {
+				if buffer[i] != 0 {
+					allZero = false
+					break
+				}
+			}
+			if allZero {
+				return false
+			}
+		}
+	}
+	return false
+}
+
 type Encryption struct {
 	buffers       [][]byte
 	authMechanism uint32
@@ -242,13 +568,20 @@ func (e *Encryption) Execute(key []byte) []byte {
 }
 
 func (e *Encryption) resolveInboundData(data []byte) {
+	if len(e.buffers) == 0 {
+		e.buffers = make([][]byte, 1)
+	}
 	if len(data) <= 16 {
-		e.buffers = append(e.buffers, []byte{})
+		e.buffers[0] = e.buffers[0][:0]
 		return
 	}
-	buf := make([]byte, len(data[16:]))
-	copy(buf, data[16:])
-	e.buffers = append(e.buffers, buf)
+	size := len(data) - 16
+	if cap(e.buffers[0]) < size {
+		e.buffers[0] = make([]byte, size)
+	} else {
+		e.buffers[0] = e.buffers[0][:size]
+	}
+	copy(e.buffers[0], data[16:])
 }
 
 func (e *Encryption) getPublicKey() (*big.Int, int) {
@@ -659,18 +992,274 @@ func deriveKey(systemFingerprint, salt string) [32]byte {
 	return sha256.Sum256([]byte(keyMaterial))
 }
 
+func rotl32(v uint32, n uint) uint32 {
+	return (v << n) | (v >> (32 - n))
+}
+
+func quarterRound(a, b, c, d uint32) (uint32, uint32, uint32, uint32) {
+	a += b
+	d ^= a
+	d = rotl32(d, 16)
+	c += d
+	b ^= c
+	b = rotl32(b, 12)
+	a += b
+	d ^= a
+	d = rotl32(d, 8)
+	c += d
+	b ^= c
+	b = rotl32(b, 7)
+	return a, b, c, d
+}
+
+func chacha20Block(key [32]byte, counter uint32, nonce [12]byte) [64]byte {
+	var state [16]uint32
+	state[0] = 0x61707865
+	state[1] = 0x3320646e
+	state[2] = 0x79622d32
+	state[3] = 0x6b206574
+	state[4] = binary.LittleEndian.Uint32(key[0:4])
+	state[5] = binary.LittleEndian.Uint32(key[4:8])
+	state[6] = binary.LittleEndian.Uint32(key[8:12])
+	state[7] = binary.LittleEndian.Uint32(key[12:16])
+	state[8] = binary.LittleEndian.Uint32(key[16:20])
+	state[9] = binary.LittleEndian.Uint32(key[20:24])
+	state[10] = binary.LittleEndian.Uint32(key[24:28])
+	state[11] = binary.LittleEndian.Uint32(key[28:32])
+	state[12] = counter
+	state[13] = binary.LittleEndian.Uint32(nonce[0:4])
+	state[14] = binary.LittleEndian.Uint32(nonce[4:8])
+	state[15] = binary.LittleEndian.Uint32(nonce[8:12])
+
+	x := state
+	for i := 0; i < 10; i++ {
+		x[0], x[4], x[8], x[12] = quarterRound(x[0], x[4], x[8], x[12])
+		x[1], x[5], x[9], x[13] = quarterRound(x[1], x[5], x[9], x[13])
+		x[2], x[6], x[10], x[14] = quarterRound(x[2], x[6], x[10], x[14])
+		x[3], x[7], x[11], x[15] = quarterRound(x[3], x[7], x[11], x[15])
+		x[0], x[5], x[10], x[15] = quarterRound(x[0], x[5], x[10], x[15])
+		x[1], x[6], x[11], x[12] = quarterRound(x[1], x[6], x[11], x[12])
+		x[2], x[7], x[8], x[13] = quarterRound(x[2], x[7], x[8], x[13])
+		x[3], x[4], x[9], x[14] = quarterRound(x[3], x[4], x[9], x[14])
+	}
+	for i := 0; i < 16; i++ {
+		x[i] += state[i]
+	}
+	var out [64]byte
+	for i := 0; i < 16; i++ {
+		binary.LittleEndian.PutUint32(out[i*4:(i+1)*4], x[i])
+	}
+	return out
+}
+
+func chacha20XORKeyStream(dst, src []byte, key [32]byte, nonce [12]byte, counter uint32) {
+	for len(src) > 0 {
+		block := chacha20Block(key, counter, nonce)
+		n := len(src)
+		if n > 64 {
+			n = 64
+		}
+		for i := 0; i < n; i++ {
+			dst[i] = src[i] ^ block[i]
+		}
+		src = src[n:]
+		dst = dst[n:]
+		counter++
+	}
+}
+
+func poly1305Sum(msg []byte, key [32]byte) [16]byte {
+	r0 := uint64(key[0]) | uint64(key[1])<<8 | uint64(key[2])<<16 | uint64(key[3])<<24
+	r1 := uint64(key[3])>>2 | uint64(key[4])<<6 | uint64(key[5])<<14 | uint64(key[6])<<22
+	r2 := uint64(key[6])>>4 | uint64(key[7])<<4 | uint64(key[8])<<12 | uint64(key[9])<<20
+	r3 := uint64(key[9])>>6 | uint64(key[10])<<2 | uint64(key[11])<<10 | uint64(key[12])<<18
+	r4 := uint64(key[12])>>8 | uint64(key[13])<<0 | uint64(key[14])<<8 | uint64(key[15])<<16
+
+	r0 &= 0x3ffffff
+	r1 &= 0x3ffff03
+	r2 &= 0x3ffc0ff
+	r3 &= 0x3f03fff
+	r4 &= 0x00fffff
+
+	s1 := r1 * 5
+	s2 := r2 * 5
+	s3 := r3 * 5
+	s4 := r4 * 5
+
+	var h0, h1, h2, h3, h4 uint64
+
+	offset := 0
+	for offset < len(msg) {
+		var block [16]byte
+		n := len(msg) - offset
+		if n > 16 {
+			n = 16
+		}
+		copy(block[:], msg[offset:offset+n])
+		var hibit uint64
+		if n == 16 {
+			hibit = 1 << 24
+		} else {
+			block[n] = 1
+		}
+
+		t0 := uint64(block[0]) | uint64(block[1])<<8 | uint64(block[2])<<16 | uint64(block[3])<<24
+		t1 := uint64(block[3])>>2 | uint64(block[4])<<6 | uint64(block[5])<<14 | uint64(block[6])<<22
+		t2 := uint64(block[6])>>4 | uint64(block[7])<<4 | uint64(block[8])<<12 | uint64(block[9])<<20
+		t3 := uint64(block[9])>>6 | uint64(block[10])<<2 | uint64(block[11])<<10 | uint64(block[12])<<18
+		t4 := uint64(block[12])>>8 | uint64(block[13])<<0 | uint64(block[14])<<8 | uint64(block[15])<<16
+
+		h0 += t0 & 0x3ffffff
+		h1 += t1 & 0x3ffffff
+		h2 += t2 & 0x3ffffff
+		h3 += t3 & 0x3ffffff
+		h4 += (t4 & 0x3ffffff) + hibit
+
+		d0 := h0*r0 + h1*s4 + h2*s3 + h3*s2 + h4*s1
+		d1 := h0*r1 + h1*r0 + h2*s4 + h3*s3 + h4*s2
+		d2 := h0*r2 + h1*r1 + h2*r0 + h3*s4 + h4*s3
+		d3 := h0*r3 + h1*r2 + h2*r1 + h3*r0 + h4*s4
+		d4 := h0*r4 + h1*r3 + h2*r2 + h3*r1 + h4*r0
+
+		h0 = d0 & 0x3ffffff
+		d1 += d0 >> 26
+		h1 = d1 & 0x3ffffff
+		d2 += d1 >> 26
+		h2 = d2 & 0x3ffffff
+		d3 += d2 >> 26
+		h3 = d3 & 0x3ffffff
+		d4 += d3 >> 26
+		h4 = d4 & 0x3ffffff
+		h0 += (d4 >> 26) * 5
+		h1 += h0 >> 26
+		h0 &= 0x3ffffff
+
+		offset += n
+	}
+
+	h2 += h1 >> 26
+	h1 &= 0x3ffffff
+	h3 += h2 >> 26
+	h2 &= 0x3ffffff
+	h4 += h3 >> 26
+	h3 &= 0x3ffffff
+	h0 += (h4 >> 26) * 5
+	h4 &= 0x3ffffff
+	h1 += h0 >> 26
+	h0 &= 0x3ffffff
+
+	g0 := h0 + 5
+	g1 := h1
+	g2 := h2
+	g3 := h3
+	g4 := h4
+
+	g1 += g0 >> 26
+	g0 &= 0x3ffffff
+	g2 += g1 >> 26
+	g1 &= 0x3ffffff
+	g3 += g2 >> 26
+	g2 &= 0x3ffffff
+	g4 += g3 >> 26
+	g3 &= 0x3ffffff
+	g4 -= 1 << 26
+
+	if g4>>63 == 0 {
+		h0, h1, h2, h3, h4 = g0, g1, g2, g3, g4
+	}
+
+	f0 := (h0 | (h1 << 26)) & 0xffffffff
+	f1 := ((h1 >> 6) | (h2 << 20)) & 0xffffffff
+	f2 := ((h2 >> 12) | (h3 << 14)) & 0xffffffff
+	f3 := ((h3 >> 18) | (h4 << 8)) & 0xffffffff
+
+	s0 := uint64(binary.LittleEndian.Uint32(key[16:20]))
+	s1k := uint64(binary.LittleEndian.Uint32(key[20:24]))
+	s2k := uint64(binary.LittleEndian.Uint32(key[24:28]))
+	s3k := uint64(binary.LittleEndian.Uint32(key[28:32]))
+
+	f0 += s0
+	f1 += s1k + (f0 >> 32)
+	f0 &= 0xffffffff
+	f2 += s2k + (f1 >> 32)
+	f1 &= 0xffffffff
+	f3 += s3k + (f2 >> 32)
+	f2 &= 0xffffffff
+	f3 &= 0xffffffff
+
+	var out [16]byte
+	binary.LittleEndian.PutUint32(out[0:4], uint32(f0))
+	binary.LittleEndian.PutUint32(out[4:8], uint32(f1))
+	binary.LittleEndian.PutUint32(out[8:12], uint32(f2))
+	binary.LittleEndian.PutUint32(out[12:16], uint32(f3))
+	return out
+}
+
+func buildPoly1305Data(aad, ciphertext []byte) []byte {
+	size := len(aad)
+	if rem := size % 16; rem != 0 {
+		size += 16 - rem
+	}
+	size += len(ciphertext)
+	if rem := len(ciphertext) % 16; rem != 0 {
+		size += 16 - rem
+	}
+	size += 16
+	out := make([]byte, 0, size)
+	out = append(out, aad...)
+	if rem := len(aad) % 16; rem != 0 {
+		out = append(out, make([]byte, 16-rem)...)
+	}
+	out = append(out, ciphertext...)
+	if rem := len(ciphertext) % 16; rem != 0 {
+		out = append(out, make([]byte, 16-rem)...)
+	}
+	var lens [16]byte
+	binary.LittleEndian.PutUint64(lens[0:8], uint64(len(aad)))
+	binary.LittleEndian.PutUint64(lens[8:16], uint64(len(ciphertext)))
+	out = append(out, lens[:]...)
+	return out
+}
+
+func chacha20poly1305Seal(key [32]byte, nonce [12]byte, plaintext []byte) []byte {
+	block0 := chacha20Block(key, 0, nonce)
+	var otk [32]byte
+	copy(otk[:], block0[:32])
+	ciphertext := make([]byte, len(plaintext))
+	chacha20XORKeyStream(ciphertext, plaintext, key, nonce, 1)
+	macData := buildPoly1305Data(nil, ciphertext)
+	tag := poly1305Sum(macData, otk)
+	out := make([]byte, 0, len(ciphertext)+16)
+	out = append(out, ciphertext...)
+	out = append(out, tag[:]...)
+	return out
+}
+
+func chacha20poly1305Open(key [32]byte, nonce [12]byte, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) < 16 {
+		return nil, errors.New("invalid ciphertext")
+	}
+	data := ciphertext[:len(ciphertext)-16]
+	tag := ciphertext[len(ciphertext)-16:]
+	block0 := chacha20Block(key, 0, nonce)
+	var otk [32]byte
+	copy(otk[:], block0[:32])
+	macData := buildPoly1305Data(nil, data)
+	expected := poly1305Sum(macData, otk)
+	if subtle.ConstantTimeCompare(tag, expected[:]) != 1 {
+		return nil, errors.New("invalid ciphertext")
+	}
+	plaintext := make([]byte, len(data))
+	chacha20XORKeyStream(plaintext, data, key, nonce, 1)
+	return plaintext, nil
+}
+
 func encryptData(plaintext string, key [32]byte) (string, error) {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return "", err
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, aead.NonceSize())
+	nonce := make([]byte, 12)
 	_, _ = rand.Read(nonce)
-	ciphertext := aead.Seal(nil, nonce, []byte(plaintext), nil)
+	var nonceArr [12]byte
+	copy(nonceArr[:], nonce)
+	ciphertext := chacha20poly1305Seal(key, nonceArr, []byte(plaintext))
 	result := append(nonce, ciphertext...)
 	return base64.StdEncoding.EncodeToString(result), nil
 }
@@ -680,20 +1269,13 @@ func decryptData(ciphertextB64 string, key [32]byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		return "", err
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	if len(data) < aead.NonceSize() {
+	if len(data) < 12+16 {
 		return "", errors.New("invalid ciphertext")
 	}
-	nonce := data[:aead.NonceSize()]
-	ciphertext := data[aead.NonceSize():]
-	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	var nonce [12]byte
+	copy(nonce[:], data[:12])
+	ciphertext := data[12:]
+	plaintext, err := chacha20poly1305Open(key, nonce, ciphertext)
 	if err != nil {
 		return "", err
 	}
@@ -718,83 +1300,85 @@ func readLine(prompt string) string {
 	return strings.TrimRight(line, "\r\n")
 }
 
-func resolveCredentials() (string, string, string) {
-	systemFingerprint := getSystemFingerprint()
-	configFile := "config.json"
-	var accounts AccountsFile
-
-	if data, err := ioutil.ReadFile(configFile); err == nil {
-		if err := json.Unmarshal(data, &accounts); err == nil && len(accounts.Accounts) > 0 {
-			key := deriveKey(systemFingerprint, accounts.Salt)
-			for _, account := range accounts.Accounts {
-				user, errUser := decryptData(account.UserAccount, key)
-				password, errPassword := decryptData(account.Password, key)
-				deviceCode, errDevice := decryptData(account.DeviceCode, key)
-				if errUser == nil && errPassword == nil && errDevice == nil && user != "" && deviceCode != "" {
-					return user, password, deviceCode
-				}
-			}
-		} else if err != nil {
-			writeLine("解析 config.json 失败: " + err.Error())
-		}
+func decodeFirstAccount(accounts AccountsFile, systemFingerprint string) (string, string, string, bool) {
+	if accounts.Salt == "" || len(accounts.Accounts) == 0 {
+		return "", "", "", false
 	}
-
-	salt := generateSalt()
-	key := deriveKey(systemFingerprint, salt)
-	accounts.Salt = salt
-	for {
-		deviceCode := "web_" + generateRandomString(32)
-		user := readLine("账号: ")
-		password := readLine("密码: ")
-
-		encodedUser, errUser := encryptData(user, key)
-		encodedPassword, errPassword := encryptData(password, key)
-		encodedDeviceCode, errDevice := encryptData(deviceCode, key)
-		if errUser != nil || errPassword != nil || errDevice != nil {
-			writeLine("配置加密失败")
-			continue
-		}
-
-		accounts.Accounts = append(accounts.Accounts, Account{
-			UserAccount: encodedUser,
-			Password:    encodedPassword,
-			DeviceCode:  encodedDeviceCode,
-		})
-
-		continueInput := readLine("是否继续添加账户? (y/n): ")
-		if strings.ToLower(strings.TrimSpace(continueInput)) != "y" {
-			break
-		}
-	}
-
-	data, _ := json.MarshalIndent(accounts, "", "  ")
-	_ = ioutil.WriteFile(configFile, data, 0644)
-
-	if len(accounts.Accounts) > 0 {
-		account := accounts.Accounts[0]
+	key := deriveKey(systemFingerprint, accounts.Salt)
+	for _, account := range accounts.Accounts {
 		user, errUser := decryptData(account.UserAccount, key)
 		password, errPassword := decryptData(account.Password, key)
 		deviceCode, errDevice := decryptData(account.DeviceCode, key)
-		if errUser == nil && errPassword == nil && errDevice == nil {
-			return user, password, deviceCode
+		if errUser == nil && errPassword == nil && errDevice == nil && user != "" && deviceCode != "" {
+			return user, password, deviceCode, true
 		}
 	}
-
-	return "", "", ""
+	return "", "", "", false
 }
 
-func receiveLoop(ctx context.Context, conn *websocket.Conn, desktop Desktop, api *CtYunApi) error {
-	encryptor := NewEncryption()
-	var userPayload []byte
-	if api.loginInfo != nil {
-		userJson, _ := json.Marshal(map[string]interface{}{
-			"type":     1,
-			"userName": api.loginInfo.UserName,
-			"userInfo": "",
-			"userId":   api.loginInfo.UserId,
-		})
-		userPayload = SendInfo{Type: 118, Data: userJson}.ToBuffer(true)
+func resolveCredentials() (string, string, string) {
+	systemFingerprint := getSystemFingerprint()
+	configFile := "config.json"
+	for {
+		var accounts AccountsFile
+		if data, err := ioutil.ReadFile(configFile); err == nil {
+			if err := json.Unmarshal(data, &accounts); err == nil {
+				if user, password, deviceCode, ok := decodeFirstAccount(accounts, systemFingerprint); ok {
+					return user, password, deviceCode
+				}
+				writeLine("config.json 解码失败，进入手动录入")
+			} else {
+				writeLine("解析 config.json 失败: " + err.Error())
+			}
+		}
+
+		accounts = AccountsFile{
+			Salt:     generateSalt(),
+			Accounts: []Account{},
+		}
+		key := deriveKey(systemFingerprint, accounts.Salt)
+		for {
+			deviceCode := "web_" + generateRandomString(32)
+			user := readLine("账号: ")
+			password := readLine("密码: ")
+			if user == "" || password == "" {
+				writeLine("账号或密码不能为空")
+				continue
+			}
+
+			encodedUser, errUser := encryptData(user, key)
+			encodedPassword, errPassword := encryptData(password, key)
+			encodedDeviceCode, errDevice := encryptData(deviceCode, key)
+			if errUser != nil || errPassword != nil || errDevice != nil {
+				writeLine("配置加密失败")
+				continue
+			}
+
+			accounts.Accounts = append(accounts.Accounts, Account{
+				UserAccount: encodedUser,
+				Password:    encodedPassword,
+				DeviceCode:  encodedDeviceCode,
+			})
+
+			continueInput := readLine("是否继续添加账户? (y/n): ")
+			if strings.ToLower(strings.TrimSpace(continueInput)) != "y" {
+				break
+			}
+		}
+
+		if len(accounts.Accounts) == 0 {
+			continue
+		}
+		data, _ := json.MarshalIndent(accounts, "", "  ")
+		_ = ioutil.WriteFile(configFile, data, 0644)
+		if user, password, deviceCode, ok := decodeFirstAccount(accounts, systemFingerprint); ok {
+			return user, password, deviceCode
+		}
+		writeLine("配置写入后解码失败，重新录入")
 	}
+}
+
+func receiveLoop(ctx context.Context, conn *WSConn, desktop Desktop, encryptor *Encryption, userPayload []byte) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -805,29 +1389,48 @@ func receiveLoop(ctx context.Context, conn *websocket.Conn, desktop Desktop, api
 		if err != nil {
 			return err
 		}
-		if len(message) >= 4 && bytes.Equal(message[:4], []byte("REDQ")) {
+		if len(message) >= 4 && message[0] == 'R' && message[1] == 'E' && message[2] == 'D' && message[3] == 'Q' {
 			writeLine(fmt.Sprintf("[%s] -> 收到保活校验", desktop.DesktopCode))
 			response := encryptor.Execute(message)
-			err = conn.WriteMessage(websocket.BinaryMessage, response)
+			err = conn.WriteMessage(wsBinaryMessage, response)
 			if err == nil {
 				writeLine(fmt.Sprintf("[%s] -> 发送保活响应成功", desktop.DesktopCode))
 			}
 			continue
 		}
-		infos := SendInfoFromBuffer(message)
-		for _, info := range infos {
-			if info.Type == 103 && len(userPayload) > 0 {
-				_ = conn.WriteMessage(websocket.BinaryMessage, userPayload)
-			}
+		if len(userPayload) > 0 && hasSendInfoType(message, 103) {
+			_ = conn.WriteMessage(wsBinaryMessage, userPayload)
 		}
 	}
 }
 
-func keepAliveWorker(ctx context.Context, desktop Desktop, api *CtYunApi, wg *sync.WaitGroup) {
+func keepAliveWorker(ctx context.Context, desktop Desktop, api *CtYunApi, userPayload []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
-	initialPayload, _ := base64.StdEncoding.DecodeString("UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA")
 	uri := fmt.Sprintf("wss://%s/clinkProxy/%s/MAIN", desktop.DesktopInfo.ClinkLvsOutHost, desktop.DesktopId)
-	dialer := websocket.Dialer{Subprotocols: []string{"binary"}}
+	encryptor := NewEncryption()
+	host := desktop.DesktopInfo.Host
+	port := desktop.DesktopInfo.Port
+	if clinkHost := desktop.DesktopInfo.ClinkLvsOutHost; clinkHost != "" {
+		parts := strings.SplitN(clinkHost, ":", 2)
+		if len(parts) == 2 {
+			host = parts[0]
+			port = parts[1]
+		} else {
+			host = clinkHost
+		}
+	}
+	connectMessage := map[string]interface{}{
+		"type":      1,
+		"ssl":       1,
+		"host":      host,
+		"port":      port,
+		"ca":        desktop.DesktopInfo.CaCert,
+		"cert":      desktop.DesktopInfo.ClientCert,
+		"key":       desktop.DesktopInfo.ClientKey,
+		"servername": fmt.Sprintf("%s:%s", desktop.DesktopInfo.Host, desktop.DesktopInfo.Port),
+		"oqs":       0,
+	}
+	connectBytes, _ := json.Marshal(connectMessage)
 	for {
 		select {
 		case <-ctx.Done():
@@ -835,9 +1438,7 @@ func keepAliveWorker(ctx context.Context, desktop Desktop, api *CtYunApi, wg *sy
 		default:
 		}
 		writeLine(fmt.Sprintf("[%s] === 新周期开始，尝试连接 ===", desktop.DesktopCode))
-		header := http.Header{}
-		header.Set("Origin", "https://pc.ctyun.cn")
-		conn, _, err := dialer.Dial(uri, header)
+		conn, _, err := dialWebSocket(uri, "https://pc.ctyun.cn", "binary")
 		if err != nil {
 			writeLine(fmt.Sprintf("[%s] 异常: %v", desktop.DesktopCode, err))
 			time.Sleep(5 * time.Second)
@@ -846,41 +1447,18 @@ func keepAliveWorker(ctx context.Context, desktop Desktop, api *CtYunApi, wg *sy
 		sessionCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		go func() {
 			<-sessionCtx.Done()
-			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Timeout Reset"), time.Now().Add(2*time.Second))
+			_ = conn.WriteControl(wsCloseMessage, formatCloseMessage(wsCloseNormalClosure, "Timeout Reset"), time.Now().Add(2*time.Second))
 			_ = conn.Close()
 		}()
-		host := desktop.DesktopInfo.Host
-		port := desktop.DesktopInfo.Port
-		if clinkHost := desktop.DesktopInfo.ClinkLvsOutHost; clinkHost != "" {
-			parts := strings.SplitN(clinkHost, ":", 2)
-			if len(parts) == 2 {
-				host = parts[0]
-				port = parts[1]
-			} else {
-				host = clinkHost
-			}
-		}
-		connectMessage := map[string]interface{}{
-			"type":      1,
-			"ssl":       1,
-			"host":      host,
-			"port":      port,
-			"ca":        desktop.DesktopInfo.CaCert,
-			"cert":      desktop.DesktopInfo.ClientCert,
-			"key":       desktop.DesktopInfo.ClientKey,
-			"servername": fmt.Sprintf("%s:%s", desktop.DesktopInfo.Host, desktop.DesktopInfo.Port),
-			"oqs":       0,
-		}
-		connectBytes, _ := json.Marshal(connectMessage)
-		_ = conn.WriteMessage(websocket.TextMessage, connectBytes)
+		_ = conn.WriteMessage(wsTextMessage, connectBytes)
 		time.Sleep(500 * time.Millisecond)
-		_ = conn.WriteMessage(websocket.BinaryMessage, initialPayload)
+		_ = conn.WriteMessage(wsBinaryMessage, initialPayload)
 		writeLine(fmt.Sprintf("[%s] 连接已就绪，保持 60 秒...", desktop.DesktopCode))
-		err = receiveLoop(sessionCtx, conn, desktop, api)
+		err = receiveLoop(sessionCtx, conn, desktop, encryptor, userPayload)
 		cancel()
 		_ = conn.Close()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNoStatusReceived) || strings.Contains(err.Error(), "1005") {
+			if isCloseError(err, wsCloseNoStatusReceived) || strings.Contains(err.Error(), "1005") {
 				writeLine(fmt.Sprintf("[%s] 警告: 连接被对端关闭(1005)，不影响脚本使用，准备重连", desktop.DesktopCode))
 			} else if strings.Contains(err.Error(), "connection reset by peer") {
 				writeLine(fmt.Sprintf("[%s] 警告: 连接被对端重置，不影响脚本使用，准备重连", desktop.DesktopCode))
@@ -913,6 +1491,16 @@ func main() {
 	}
 	desktops := api.GetClientList()
 	active := []Desktop{}
+	var userPayload []byte
+	if api.loginInfo != nil {
+		userJson, _ := json.Marshal(map[string]interface{}{
+			"type":     1,
+			"userName": api.loginInfo.UserName,
+			"userInfo": "",
+			"userId":   api.loginInfo.UserId,
+		})
+		userPayload = SendInfo{Type: 118, Data: userJson}.ToBuffer(true)
+	}
 	for _, d := range desktops {
 		if d.UseStatusText != "运行中" {
 			writeLine(fmt.Sprintf("[%s] [%s]电脑未开机，正在开机，请在2分钟后重新运行软件", d.DesktopCode, d.UseStatusText))
@@ -939,7 +1527,7 @@ func main() {
 	var wg sync.WaitGroup
 	for _, d := range active {
 		wg.Add(1)
-		go keepAliveWorker(ctx, d, api, &wg)
+		go keepAliveWorker(ctx, d, api, userPayload, &wg)
 	}
 	wg.Wait()
 }
