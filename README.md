@@ -7,7 +7,6 @@
 ### Python 版本
 
 ```bash
-pip install websockets
 python ctyun_keepalive.py
 ```
 
@@ -15,12 +14,8 @@ python ctyun_keepalive.py
 
 运行：
 ```bash
-go mod init ctyun_keepalive
-go env -w GOPROXY=https://goproxy.cn,direct
-go mod tidy
 go run ctyun_keepalive.go
 ```
 
-## 版本
-
-v 1.0.0
+## 项目特点
+代码尽量使用了标准库进行了功能实现，一般情况下直接运行即可
