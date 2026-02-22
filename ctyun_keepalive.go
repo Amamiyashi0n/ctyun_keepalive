@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
@@ -15,8 +17,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/big"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -90,10 +94,34 @@ type Desktop struct {
 	DesktopInfo  *DesktopInfo `json:"-"`
 }
 
-type ResultBase[T any] struct {
-	Code int    `json:"code"`
+type ResultLoginInfo struct {
+	Code int       `json:"code"`
+	Msg  string    `json:"msg"`
+	Data LoginInfo `json:"data"`
+}
+
+type ResultChallengeData struct {
+	Code int          `json:"code"`
+	Msg  string       `json:"msg"`
+	Data ChallengeData `json:"data"`
+}
+
+type ResultBool struct {
+	Code int  `json:"code"`
 	Msg  string `json:"msg"`
-	Data T      `json:"data"`
+	Data bool `json:"data"`
+}
+
+type ResultClientInfo struct {
+	Code int       `json:"code"`
+	Msg  string    `json:"msg"`
+	Data ClientInfo `json:"data"`
+}
+
+type ResultConnectInfo struct {
+	Code int        `json:"code"`
+	Msg  string     `json:"msg"`
+	Data ConnectInfo `json:"data"`
 }
 
 type ChallengeData struct {
@@ -121,6 +149,7 @@ type Account struct {
 }
 
 type AccountsFile struct {
+	Salt     string    `json:"salt"`
 	Accounts []Account `json:"accounts"`
 }
 
@@ -145,15 +174,25 @@ func (s SendInfo) ToBuffer(isBuildMsg bool) []byte {
 }
 
 func SendInfoFromBuffer(buffer []byte) []SendInfo {
-	results := []SendInfo{}
+	results := make([]SendInfo, 0, len(buffer)/6)
 	if len(buffer) == 0 {
 		return results
 	}
 	offset := 0
 	for offset+6 <= len(buffer) {
 		typeValue := int(binary.LittleEndian.Uint16(buffer[offset : offset+2]))
-		dataLength := int(int32(binary.LittleEndian.Uint32(buffer[offset+2 : offset+6])))
-		if dataLength < 0 || offset+6+dataLength > len(buffer) {
+		dataLengthU := binary.LittleEndian.Uint32(buffer[offset+2 : offset+6])
+		if dataLengthU > 0x7fffffff {
+			remaining := len(buffer) - offset
+			if remaining > 0 {
+				data := make([]byte, remaining)
+				copy(data, buffer[offset:offset+remaining])
+				results = append(results, SendInfo{Type: typeValue, Data: data})
+			}
+			break
+		}
+		dataLength := int(dataLengthU)
+		if offset+6+dataLength > len(buffer) {
 			remaining := len(buffer) - offset
 			if remaining > 0 {
 				data := make([]byte, remaining)
@@ -258,10 +297,11 @@ func (e *Encryption) mgf1(seed []byte, maskLen int) []byte {
 	mask := make([]byte, maskLen)
 	counter := 0
 	offset := 0
+	seedLen := len(seed)
+	block := make([]byte, seedLen+4)
+	copy(block, seed)
 	for offset < maskLen {
-		c := make([]byte, 4)
-		binary.BigEndian.PutUint32(c, uint32(counter))
-		block := append(append([]byte{}, seed...), c...)
+		binary.BigEndian.PutUint32(block[seedLen:], uint32(counter))
 		hashBytes := sha1.Sum(block)
 		copyLen := len(hashBytes)
 		if copyLen > maskLen-offset {
@@ -321,7 +361,7 @@ func (api *CtYunApi) Login(userPhone, password string) bool {
 		collection.Add("challengeId", challenge.ChallengeId)
 		collection.Add("captchaCode", captchaCode)
 		api.addCollection(collection)
-		var result ResultBase[LoginInfo]
+		var result ResultLoginInfo
 		err := api.postForm("https://desk.ctyun.cn:8810/api/auth/client/login", collection, &result)
 		if err == nil && result.Code == 0 {
 			api.loginInfo = &result.Data
@@ -343,7 +383,7 @@ func (api *CtYunApi) GetSmsCode(userPhone string) bool {
 	for i := 0; i < 3; i++ {
 		captchaCode := api.GetCaptcha(api.GetSmsCodeCaptcha())
 		if captchaCode != "" {
-			var result ResultBase[bool]
+			var result ResultBool
 			err := api.getJSON("https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone="+userPhone+"&captchaCode="+captchaCode, &result)
 			if err == nil && result.Code == 0 {
 				return true
@@ -360,7 +400,7 @@ func (api *CtYunApi) GetSmsCode(userPhone string) bool {
 
 func (api *CtYunApi) BindingDevice(verificationCode string) bool {
 	urlStr := "https://desk.ctyun.cn:8810/api/cdserv/client/device/binding?verificationCode=" + url.QueryEscape(verificationCode) + "&deviceName=Chrome%E6%B5%8F%E8%A7%88%E5%99%A8&deviceCode=" + url.QueryEscape(api.deviceCode) + "&deviceModel=Windows+NT+10.0%3B+Win64%3B+x64&sysVersion=Windows+NT+10.0%3B+Win64%3B+x64&appVersion=3.2.0&hostName=pc.ctyun.cn&deviceInfo=Win32"
-	var result ResultBase[bool]
+	var result ResultBool
 	err := api.postJSON(urlStr, nil, &result)
 	if err == nil && result.Code == 0 {
 		return true
@@ -374,7 +414,7 @@ func (api *CtYunApi) BindingDevice(verificationCode string) bool {
 }
 
 func (api *CtYunApi) GetGenChallengeData() *ChallengeData {
-	var result ResultBase[ChallengeData]
+	var result ResultChallengeData
 	err := api.postJSON("https://desk.ctyun.cn:8810/api/auth/client/genChallengeData", map[string]string{}, &result)
 	if err == nil && result.Code == 0 {
 		return &result.Data
@@ -441,12 +481,12 @@ func (api *CtYunApi) GetCaptcha(imgBytes []byte) string {
 }
 
 func (api *CtYunApi) GetClientList() []Desktop {
-	payload := map[string]any{
+	payload := map[string]interface{}{
 		"getCnt":        20,
 		"desktopTypes":  []string{"1", "2001", "2002", "2003"},
 		"sortType":      "createTimeV1",
 	}
-	var result ResultBase[ClientInfo]
+	var result ResultClientInfo
 	err := api.postJSON("https://desk.ctyun.cn:8810/api/desktop/client/pageDesktop", payload, &result)
 	if err != nil || result.Code != 0 {
 		msg := result.Msg
@@ -469,7 +509,7 @@ func (api *CtYunApi) Connect(desktopId string) (*ConnectInfo, string) {
 	collection.Add("ipAddress", "")
 	collection.Add("macAddress", "")
 	api.addCollection(collection)
-	var result ResultBase[ConnectInfo]
+	var result ResultConnectInfo
 	err := api.postForm("https://desk.ctyun.cn:8810/api/desktop/client/connect", collection, &result)
 	if err != nil || result.Code != 0 {
 		msg := result.Msg
@@ -485,7 +525,7 @@ func (api *CtYunApi) applySignature(headers map[string]string) {
 	if api.loginInfo == nil {
 		return
 	}
-	timestamp := fmt.Sprintf("%d", time.Now().UnixMilli())
+	timestamp := fmt.Sprintf("%d", time.Now().UnixNano()/int64(time.Millisecond))
 	headers["ctg-userid"] = fmt.Sprintf("%d", api.loginInfo.UserId)
 	headers["ctg-tenantid"] = fmt.Sprintf("%d", api.loginInfo.TenantId)
 	headers["ctg-timestamp"] = timestamp
@@ -527,10 +567,17 @@ func (api *CtYunApi) request(method, urlStr string, body io.Reader, headers map[
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("http status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+	return bodyBytes, nil
 }
 
-func (api *CtYunApi) postJSON(urlStr string, payload any, out any) error {
+func (api *CtYunApi) postJSON(urlStr string, payload interface{}, out interface{}) error {
 	var body io.Reader
 	headers := map[string]string{}
 	if payload != nil {
@@ -548,7 +595,7 @@ func (api *CtYunApi) postJSON(urlStr string, payload any, out any) error {
 	return json.Unmarshal(resp, out)
 }
 
-func (api *CtYunApi) postForm(urlStr string, values url.Values, out any) error {
+func (api *CtYunApi) postForm(urlStr string, values url.Values, out interface{}) error {
 	body := strings.NewReader(values.Encode())
 	headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
 	resp, err := api.request("POST", urlStr, body, headers, true)
@@ -558,7 +605,7 @@ func (api *CtYunApi) postForm(urlStr string, values url.Values, out any) error {
 	return json.Unmarshal(resp, out)
 }
 
-func (api *CtYunApi) getJSON(urlStr string, out any) error {
+func (api *CtYunApi) getJSON(urlStr string, out interface{}) error {
 	resp, err := api.request("GET", urlStr, nil, map[string]string{}, true)
 	if err != nil {
 		return err
@@ -586,6 +633,73 @@ func computeSHA256(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func getSystemFingerprint() string {
+	interfaces, err := net.Interfaces()
+	macAddress := "unknown"
+	if err == nil {
+		for _, iface := range interfaces {
+			if len(iface.HardwareAddr) > 0 {
+				macAddress = iface.HardwareAddr.String()
+				break
+			}
+		}
+	}
+	hash := sha256.Sum256([]byte(macAddress))
+	return hex.EncodeToString(hash[:])
+}
+
+func generateSalt() string {
+	salt := make([]byte, 16)
+	_, _ = rand.Read(salt)
+	return hex.EncodeToString(salt)
+}
+
+func deriveKey(systemFingerprint, salt string) [32]byte {
+	keyMaterial := systemFingerprint + "|" + salt
+	return sha256.Sum256([]byte(keyMaterial))
+}
+
+func encryptData(plaintext string, key [32]byte) (string, error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	_, _ = rand.Read(nonce)
+	ciphertext := aead.Seal(nil, nonce, []byte(plaintext), nil)
+	result := append(nonce, ciphertext...)
+	return base64.StdEncoding.EncodeToString(result), nil
+}
+
+func decryptData(ciphertextB64 string, key [32]byte) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(ciphertextB64)
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(data) < aead.NonceSize() {
+		return "", errors.New("invalid ciphertext")
+	}
+	nonce := data[:aead.NonceSize()]
+	ciphertext := data[aead.NonceSize():]
+	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
+
 func generateRandomString(length int) string {
 	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, length)
@@ -605,59 +719,82 @@ func readLine(prompt string) string {
 }
 
 func resolveCredentials() (string, string, string) {
-	if _, err := os.Stat("/.dockerenv"); err == nil {
-		return os.Getenv("APP_USER"), os.Getenv("APP_PASSWORD"), os.Getenv("DEVICECODE")
-	}
-	
-	accountsFile := "accounts.json"
+	systemFingerprint := getSystemFingerprint()
+	configFile := "config.json"
 	var accounts AccountsFile
-	
-	if data, err := os.ReadFile(accountsFile); err == nil {
+
+	if data, err := ioutil.ReadFile(configFile); err == nil {
 		if err := json.Unmarshal(data, &accounts); err == nil && len(accounts.Accounts) > 0 {
-			account := accounts.Accounts[0]
-			userBytes, _ := base64.StdEncoding.DecodeString(account.UserAccount)
-			passwordBytes, _ := base64.StdEncoding.DecodeString(account.Password)
-			return string(userBytes), string(passwordBytes), account.DeviceCode
+			key := deriveKey(systemFingerprint, accounts.Salt)
+			for _, account := range accounts.Accounts {
+				user, errUser := decryptData(account.UserAccount, key)
+				password, errPassword := decryptData(account.Password, key)
+				deviceCode, errDevice := decryptData(account.DeviceCode, key)
+				if errUser == nil && errPassword == nil && errDevice == nil && user != "" && deviceCode != "" {
+					return user, password, deviceCode
+				}
+			}
+		} else if err != nil {
+			writeLine("解析 config.json 失败: " + err.Error())
 		}
 	}
-	
+
+	salt := generateSalt()
+	key := deriveKey(systemFingerprint, salt)
+	accounts.Salt = salt
 	for {
 		deviceCode := "web_" + generateRandomString(32)
 		user := readLine("账号: ")
 		password := readLine("密码: ")
-		
-		encodedUser := base64.StdEncoding.EncodeToString([]byte(user))
-		encodedPassword := base64.StdEncoding.EncodeToString([]byte(password))
-		
+
+		encodedUser, errUser := encryptData(user, key)
+		encodedPassword, errPassword := encryptData(password, key)
+		encodedDeviceCode, errDevice := encryptData(deviceCode, key)
+		if errUser != nil || errPassword != nil || errDevice != nil {
+			writeLine("配置加密失败")
+			continue
+		}
+
 		accounts.Accounts = append(accounts.Accounts, Account{
 			UserAccount: encodedUser,
 			Password:    encodedPassword,
-			DeviceCode:  deviceCode,
+			DeviceCode:  encodedDeviceCode,
 		})
-		
-		_ = os.WriteFile("DeviceCode.txt", []byte(deviceCode), 0644)
-		
+
 		continueInput := readLine("是否继续添加账户? (y/n): ")
 		if strings.ToLower(strings.TrimSpace(continueInput)) != "y" {
 			break
 		}
 	}
-	
+
 	data, _ := json.MarshalIndent(accounts, "", "  ")
-	_ = os.WriteFile(accountsFile, data, 0644)
-	
+	_ = ioutil.WriteFile(configFile, data, 0644)
+
 	if len(accounts.Accounts) > 0 {
 		account := accounts.Accounts[0]
-		userBytes, _ := base64.StdEncoding.DecodeString(account.UserAccount)
-		passwordBytes, _ := base64.StdEncoding.DecodeString(account.Password)
-		return string(userBytes), string(passwordBytes), account.DeviceCode
+		user, errUser := decryptData(account.UserAccount, key)
+		password, errPassword := decryptData(account.Password, key)
+		deviceCode, errDevice := decryptData(account.DeviceCode, key)
+		if errUser == nil && errPassword == nil && errDevice == nil {
+			return user, password, deviceCode
+		}
 	}
-	
+
 	return "", "", ""
 }
 
 func receiveLoop(ctx context.Context, conn *websocket.Conn, desktop Desktop, api *CtYunApi) error {
 	encryptor := NewEncryption()
+	var userPayload []byte
+	if api.loginInfo != nil {
+		userJson, _ := json.Marshal(map[string]interface{}{
+			"type":     1,
+			"userName": api.loginInfo.UserName,
+			"userInfo": "",
+			"userId":   api.loginInfo.UserId,
+		})
+		userPayload = SendInfo{Type: 118, Data: userJson}.ToBuffer(true)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -679,15 +816,8 @@ func receiveLoop(ctx context.Context, conn *websocket.Conn, desktop Desktop, api
 		}
 		infos := SendInfoFromBuffer(message)
 		for _, info := range infos {
-			if info.Type == 103 {
-				userJson, _ := json.Marshal(map[string]any{
-					"type":     1,
-					"userName": api.loginInfo.UserName,
-					"userInfo": "",
-					"userId":   api.loginInfo.UserId,
-				})
-				payload := SendInfo{Type: 118, Data: userJson}.ToBuffer(true)
-				_ = conn.WriteMessage(websocket.BinaryMessage, payload)
+			if info.Type == 103 && len(userPayload) > 0 {
+				_ = conn.WriteMessage(websocket.BinaryMessage, userPayload)
 			}
 		}
 	}
@@ -713,17 +843,28 @@ func keepAliveWorker(ctx context.Context, desktop Desktop, api *CtYunApi, wg *sy
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		sessionCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
+		sessionCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		go func() {
 			<-sessionCtx.Done()
 			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Timeout Reset"), time.Now().Add(2*time.Second))
 			_ = conn.Close()
 		}()
-		connectMessage := map[string]any{
+		host := desktop.DesktopInfo.Host
+		port := desktop.DesktopInfo.Port
+		if clinkHost := desktop.DesktopInfo.ClinkLvsOutHost; clinkHost != "" {
+			parts := strings.SplitN(clinkHost, ":", 2)
+			if len(parts) == 2 {
+				host = parts[0]
+				port = parts[1]
+			} else {
+				host = clinkHost
+			}
+		}
+		connectMessage := map[string]interface{}{
 			"type":      1,
 			"ssl":       1,
-			"host":      strings.Split(desktop.DesktopInfo.ClinkLvsOutHost, ":")[0],
-			"port":      strings.Split(desktop.DesktopInfo.ClinkLvsOutHost, ":")[1],
+			"host":      host,
+			"port":      port,
 			"ca":        desktop.DesktopInfo.CaCert,
 			"cert":      desktop.DesktopInfo.ClientCert,
 			"key":       desktop.DesktopInfo.ClientKey,
